@@ -1,0 +1,47 @@
+{
+  "name": "proofpay-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "prisma:generate:postgres": "prisma generate --schema prisma/postgres/schema.prisma",
+"prisma:migrate:postgres": "prisma migrate deploy --schema prisma/postgres/schema.prisma",
+"prisma:status:postgres": "prisma migrate status --schema prisma/postgres/schema.prisma",
+"prisma:validate:postgres": "prisma validate --schema prisma/postgres/schema.prisma",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx --test tests/health.test.ts tests/phase0.test.ts tests/phase1.api.test.ts tests/money.test.ts tests/aiScoring.test.ts tests/gemini.service.test.ts tests/migration.test.ts tests/seed.integrity.test.ts",
+    "test:hermetic": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase0.test.js .testbuild/tests/phase1.api.test.js .testbuild/tests/money.test.js .testbuild/tests/aiScoring.test.js .testbuild/tests/gemini.service.test.js .testbuild/tests/migration.test.js .testbuild/tests/seed.integrity.test.js",
+    "test:phase0": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase0.test.js",
+    "test:phase1": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase1.api.test.js .testbuild/tests/money.test.js .testbuild/tests/aiScoring.test.js .testbuild/tests/gemini.service.test.js .testbuild/tests/migration.test.js .testbuild/tests/seed.integrity.test.js",
+    "prisma:migrate": "prisma migrate deploy",
+    "db:migrate:check": "prisma migrate status",
+    "db:relabel-simulated": "tsx src/scripts/relabelSimulatedPayments.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push --skip-generate",
+    "prisma:seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^5.11.0",
+    "@proofpay/shared": "file:../shared",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.4",
+    "helmet": "^8.3.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.28",
+    "@types/supertest": "^6.0.2",
+    "prisma": "^5.11.0",
+    "supertest": "^6.3.4",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3",
+    "vitest": "^1.4.0"
+  }
+}

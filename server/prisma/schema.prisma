@@ -1,0 +1,177 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id               String      @id @default(cuid())
+  email            String      @unique
+  name             String
+  role             String      // "CLIENT" | "FREELANCER" (CHECK constraint)
+  title            String
+  avatarUrl        String?
+  paypalEmail      String?
+  isDemoAccount    Boolean     @default(true)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  clientProjects   Project[]   @relation("ClientProjects")
+  assignedProjects Project[]   @relation("FreelancerProjects")
+  submissions      DeliverableSubmission[]
+  auditLogs        AuditLog[]
+}
+
+model Project {
+  id           String      @id @default(cuid())
+  title        String
+  description  String
+  // Money is stored as INTEGER MINOR UNITS (cents/paise/yen). Never as floating point.
+  totalBudgetMinor  Int
+  legacyTotalBudget Float?   // pre-Phase-1 float value, kept for audit/rollback only. Never read by the app.
+  currency     String      @default("USD") // whitelist enforced by CHECK constraint + shared Zod schema
+  status       String      @default("DRAFT") // "DRAFT" | "ACTIVE" | "COMPLETED" | "CANCELLED" (CHECK constraint)
+  deadline     DateTime?
+  
+  clientId     String
+  client       User        @relation("ClientProjects", fields: [clientId], references: [id])
+  
+  freelancerId String?
+  freelancer   User?       @relation("FreelancerProjects", fields: [freelancerId], references: [id])
+  
+  milestones   Milestone[]
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([clientId])
+  @@index([freelancerId])
+  @@index([status])
+}
+
+model Milestone {
+  id                 String             @id @default(cuid())
+  projectId          String
+  project            Project            @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  
+  orderIndex         Int
+  title              String
+  description        String
+  amountMinor        Int                // integer minor units (CHECK > 0)
+  legacyAmount       Float?             // pre-Phase-1 float value, kept for audit/rollback only. Never read by the app.
+  currency           String             @default("USD")
+  deadline           DateTime?
+  status             String             @default("DRAFT") // "DRAFT" | "AWAITING_PAYMENT_AUTH" | "IN_PROGRESS" | "SUBMITTED" | "AI_REVIEWED" | "PAYMENT_APPROVED" | "COMPLETED" | "REVISION_REQUESTED"
+  
+  // JSON array string: string[]
+  acceptanceCriteria String             @default("[]")
+  
+  submissions        DeliverableSubmission[]
+  paymentRecords     PaymentRecord[]
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@unique([projectId, orderIndex])
+  @@index([projectId, status])
+}
+
+model DeliverableSubmission {
+  id                   String      @id @default(cuid())
+  milestoneId          String
+  milestone            Milestone   @relation(fields: [milestoneId], references: [id], onDelete: Restrict)
+  
+  authorId             String
+  author               User        @relation(fields: [authorId], references: [id])
+  
+  revision             Int         // 1-based submission number per milestone
+  summary              String
+  deliverableUrl       String      // Accessible repository or demo preview URL
+  notes                String?
+  uploadedEvidenceText String?     // Accessible deliverable code or output text for AI verification
+  
+  aiReviews            AIReview[]
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  @@unique([milestoneId, revision])
+  @@index([authorId])
+}
+
+model AIReview {
+  id                    String                @id @default(cuid())
+  submissionId          String
+  submission            DeliverableSubmission @relation(fields: [submissionId], references: [id], onDelete: Restrict)
+  
+  sequence              Int                   // 1-based review number per submission (re-audits append, never overwrite)
+  overallStatus         String                // "COMPLIANT" | "PARTIAL" | "NON_COMPLIANT"
+  overallScore          Int                   @default(0) // 0-100, computed SERVER-SIDE from validated per-criterion verdicts
+  legacyConfidenceScore Float?                // pre-Phase-1 value (was overallScore/100). Misleading; kept for history only, never read.
+  evidenceCoveragePercent Int                 @default(0) // % of criteria the evidence allowed a verdict on. NOT a probability of correctness.
+  scoringPolicyVersion  String                @default("legacy") // e.g. "server-v1"
+  recommendationReasons String                @default("[]") // JSON array: why the server chose this recommendation
+  modelOverallScore     Int?                  // what the model claimed (audit trail only, never trusted)
+  modelRecommendation   String?               // what the model claimed (audit trail only, never trusted)
+  summary               String
+  recommendation        String                @default("MANUAL_REVIEW") // APPROVE_RECOMMENDED | REQUEST_REVISION | MANUAL_REVIEW (server-computed; CHECK constraint)
+  
+  // JSON stringified fields
+  criteriaResults       String                @default("[]") // JSON: Array<{ criterionId, status, score, reasoning, evidenceReference }>
+  criteriaAnalysis      String                // JSON array of CriterionAnalysis (legacy compat)
+  strengths             String                // JSON array of strings
+  gapsIdentified        String                // JSON array of strings
+  missingEvidence       String                // JSON array of strings
+  risks                 String                @default("[]") // JSON array of risk strings
+  evidenceLimitations   String                // JSON array of strings
+  clientRecommendation  String
+  freelancerActionItems String                // JSON array of strings
+  advisoryNotice        String                // Mandatory non-automated payment disclaimer
+  
+  modelId               String                @default("unknown") // model that actually produced the verdicts
+  rawResponse           String?               // Raw model JSON for audit trail
+  
+  createdAt             DateTime              @default(now())
+
+  @@unique([submissionId, sequence])
+  @@index([submissionId, createdAt])
+}
+
+model PaymentRecord {
+  id                  String     @id @default(cuid())
+  milestoneId         String
+  // Financial history is never cascade-deleted with its milestone.
+  milestone           Milestone  @relation(fields: [milestoneId], references: [id], onDelete: Restrict)
+  
+  provider            String     // "LOCAL_DEV" | "PAYPAL" (CHECK constraint: LOCAL-DEV-* ids <=> provider LOCAL_DEV)
+  orderId             String     @unique // Separate order id per payment attempt
+  authorizationId     String?    @unique // Authorization id (AUTHORIZE intent)
+  captureId           String?    @unique // Capture id (created only upon explicit human client approval)
+  
+  amountMinor         Int        // integer minor units (CHECK > 0)
+  legacyAmount        Float?     // pre-Phase-1 float value, kept for audit/rollback only. Never read by the app.
+  currency            String     @default("USD")
+  status              String     @default("CREATED") // "CREATED" | "AUTHORIZED" | "CAPTURED" | "VOIDED" | "EXPIRED" | "DENIED" | "FAILED"
+  expiresAt           DateTime?  // PayPal authorization expiration timestamp
+  
+  rawProviderMetadata String?    // JSON string of PayPal API response payload
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  @@index([milestoneId, createdAt])
+  @@index([status])
+}
+
+model AuditLog {
+  id         String    @id @default(cuid())
+  userId     String?
+  user       User?     @relation(fields: [userId], references: [id])
+  action     String    // e.g. "ORDER_CREATED", "FUNDS_AUTHORIZED", "SUBMISSION_EVALUATED", "PAYMENT_CAPTURED"
+  entityType String    // "PROJECT" | "MILESTONE" | "PAYMENT" | "SUBMISSION"
+  entityId   String
+  details    String?   // JSON string
+  createdAt  DateTime  @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+}
