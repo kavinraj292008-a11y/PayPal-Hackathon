@@ -1,4 +1,10 @@
-import React, { useState } from 'react';
+
+import React, { useEffect, useState } from 'react';
+import {
+  PayPalScriptProvider,
+  PayPalButtons,
+} from '@paypal/react-paypal-js';
+
 import {
   MilestoneItem,
   updateMilestone,
@@ -6,28 +12,30 @@ import {
   getApiErrorMessage,
   submitDeliverable,
   auditSubmissionWithAI,
+  fetchPayPalConfig,
+  createPayPalOrder,
+  authorizePayPalOrder,
+  capturePayPalMilestone,
 } from '../../api/client';
+
 import { useDemoRole } from '../../context/DemoRoleContext';
 import { Card } from '../common/Card';
 import { Badge } from '../common/Badge';
 import { Button } from '../common/Button';
 import { SimulatedBadge } from '../common/SimulatedBadge';
 import { AIAuditReportCard, AIAuditData } from '../ai/AIAuditReportCard';
+
 import {
   CheckCircle2,
   Lock,
-  Clock,
   ExternalLink,
-  ShieldCheck,
   Sparkles,
   FileText,
   AlertCircle,
   Plus,
   Send,
-  Cpu,
-  RefreshCw,
-  HelpCircle,
 } from 'lucide-react';
+
 import { formatMoney, safeHref } from '../../lib/money';
 
 interface MilestoneDetailViewProps {
@@ -36,18 +44,31 @@ interface MilestoneDetailViewProps {
   onRefresh: () => void;
 }
 
+interface PayPalConfig {
+  enabled: boolean;
+  clientId: string;
+  currency: string;
+  environment: 'sandbox';
+}
+
 export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
   milestone,
   currency = 'USD',
   onRefresh,
 }) => {
   const { activeRole } = useDemoRole();
+
   const [newCriterion, setNewCriterion] = useState('');
   const [isAddingCriterion, setIsAddingCriterion] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isAuditingAI, setIsAuditingAI] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+
   const [auditError, setAuditError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [paypalError, setPaypalError] = useState<string | null>(null);
+
+  const [paypalConfig, setPaypalConfig] = useState<PayPalConfig | null>(null);
 
   // Freelancer submission form state
   const [isSubmittingDeliverable, setIsSubmittingDeliverable] = useState(false);
@@ -56,30 +77,70 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
   const [submissionNotes, setSubmissionNotes] = useState('');
   const [evidenceText, setEvidenceText] = useState('');
 
+  // Load PayPal Sandbox configuration
+  useEffect(() => {
+    let mounted = true;
+
+    fetchPayPalConfig()
+      .then((config) => {
+        if (mounted) setPaypalConfig(config);
+      })
+      .catch((err) => {
+        if (mounted) {
+          setPaypalError(
+            getApiErrorMessage(err, 'Unable to load PayPal configuration.')
+          );
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const latestSubmission = milestone.submissions?.[0];
-  const latestAIReview = latestSubmission?.aiReviews?.[0] as AIAuditData | undefined;
+  const latestAIReview = latestSubmission?.aiReviews?.[0] as
+    | AIAuditData
+    | undefined;
+
   const payment = milestone.currentPayment;
-  // Amount/criteria are frozen by the server once a milestone is funded/active.
+
   const termsLocked = !(
-    milestone.status === 'DRAFT' || milestone.status === 'AWAITING_PAYMENT_AUTH'
+    milestone.status === 'DRAFT' ||
+    milestone.status === 'AWAITING_PAYMENT_AUTH'
   );
-  const canAudit = milestone.status === 'SUBMITTED' || milestone.status === 'AI_REVIEWED';
+
+  const canAudit =
+    milestone.status === 'SUBMITTED' ||
+    milestone.status === 'AI_REVIEWED';
+
+  const isPayPalPayment =
+    payment?.provider === 'PAYPAL' && payment?.simulated === false;
 
   // Add Acceptance Criterion
   const handleAddCriterion = async () => {
     if (!newCriterion.trim()) return;
+
     try {
       setIsUpdating(true);
-      const updatedCriteria = [...milestone.acceptanceCriteria, newCriterion.trim()];
+      setActionError(null);
+
+      const updatedCriteria = [
+        ...milestone.acceptanceCriteria,
+        newCriterion.trim(),
+      ];
+
       await updateMilestone(milestone.id, {
         acceptanceCriteria: updatedCriteria,
       });
+
       setNewCriterion('');
       setIsAddingCriterion(false);
       onRefresh();
     } catch (err) {
-      console.error('Failed to add criterion:', err);
-      setActionError(getApiErrorMessage(err, 'Failed to add criterion'));
+      setActionError(
+        getApiErrorMessage(err, 'Failed to add criterion')
+      );
     } finally {
       setIsUpdating(false);
     }
@@ -95,6 +156,7 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
     try {
       setIsSubmittingDeliverable(true);
       setAuditError(null);
+
       await submitDeliverable(milestone.id, {
         summary: deliverableSummary.trim(),
         deliverableUrl: deliverableUrl.trim(),
@@ -102,21 +164,25 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
         uploadedEvidenceText: evidenceText.trim() || undefined,
       });
 
-      // Clear form
       setDeliverableUrl('');
       setDeliverableSummary('');
       setSubmissionNotes('');
       setEvidenceText('');
+
       onRefresh();
     } catch (err: any) {
       console.error('Failed to submit deliverable:', err);
-      alert(err.response?.data?.error || err.message || 'Submission failed');
+      alert(
+        err.response?.data?.error ||
+          err.message ||
+          'Submission failed'
+      );
     } finally {
       setIsSubmittingDeliverable(false);
     }
   };
 
-  // Feature 2: Trigger AI Evidence Audit with Gemini
+  // AI Evidence Audit
   const handleRunAIAudit = async () => {
     if (!latestSubmission) {
       alert('No submission found to audit.');
@@ -126,58 +192,64 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
     try {
       setIsAuditingAI(true);
       setAuditError(null);
+
       await auditSubmissionWithAI(latestSubmission.id);
       onRefresh();
     } catch (err: any) {
       console.error('AI Audit failed:', err);
+
       const errMsg =
         err.response?.data?.error ||
         err.message ||
         'AI Audit failed. Ensure GEMINI_API_KEY is configured on the server.';
+
       setAuditError(errMsg);
     } finally {
       setIsAuditingAI(false);
     }
   };
 
-  // Client Approval Transitions
-  const handleClientAuthorize = async () => {
+  // Client captures an existing PayPal authorization
+  const handleCapturePayment = async () => {
     try {
-      setIsUpdating(true);
+      setIsCapturing(true);
       setActionError(null);
-      await transitionMilestone(milestone.id, 'IN_PROGRESS');
+
+      await capturePayPalMilestone(milestone.id);
+
       onRefresh();
     } catch (err) {
-      console.error('Failed to authorize milestone:', err);
-      setActionError(getApiErrorMessage(err, 'Failed to authorize milestone'));
+      console.error('PayPal capture failed:', err);
+
+      setActionError(
+        getApiErrorMessage(
+          err,
+          'PayPal capture failed. Please verify the payment status before retrying.'
+        )
+      );
     } finally {
-      setIsUpdating(false);
+      setIsCapturing(false);
     }
   };
 
-  const handleClientApprove = async () => {
-    try {
-      setIsUpdating(true);
-      setActionError(null);
-      await transitionMilestone(milestone.id, 'COMPLETED');
-      onRefresh();
-    } catch (err) {
-      console.error('Failed to approve milestone:', err);
-      setActionError(getApiErrorMessage(err, 'Failed to approve milestone'));
-    } finally {
-      setIsUpdating(false);
-    }
-  };
-
+  // Client requests revision
   const handleClientRequestRevision = async () => {
     try {
       setIsUpdating(true);
       setActionError(null);
-      await transitionMilestone(milestone.id, 'REVISION_REQUESTED');
+
+      await transitionMilestone(
+        milestone.id,
+        'REVISION_REQUESTED'
+      );
+
       onRefresh();
     } catch (err) {
       console.error('Failed to request revision:', err);
-      setActionError(getApiErrorMessage(err, 'Failed to request revision'));
+
+      setActionError(
+        getApiErrorMessage(err, 'Failed to request revision')
+      );
     } finally {
       setIsUpdating(false);
     }
@@ -185,7 +257,7 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Milestone Header Banner */}
+      {/* Milestone Header */}
       <div className="bg-white border border-slate-200/90 rounded-2xl p-6 shadow-subtle space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="space-y-1">
@@ -195,6 +267,7 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               </span>
               <Badge status={milestone.status} showIcon />
             </div>
+
             <h2 className="text-xl font-bold text-slate-900 tracking-tight">
               {milestone.title}
             </h2>
@@ -214,22 +287,24 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
           {milestone.description}
         </p>
 
-        {/* Milestone Payment Card (development simulation only) */}
+        {/* Payment Record */}
         <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
               <Lock className="w-4 h-4 text-slate-500" />
               Payment Record
             </div>
+
             {(payment?.simulated ?? true) && <SimulatedBadge />}
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
             <div className="bg-white p-2.5 rounded-lg border border-slate-200/80">
               <span className="text-[10px] text-slate-400 block uppercase font-medium">
-                {payment?.simulated === false ? 'PayPal Order ID' : 'Dev Order Reference'}
+                {isPayPalPayment ? 'PayPal Order ID' : 'Dev Order Reference'}
               </span>
-              <span className="font-mono text-slate-800 text-[11px] font-semibold">
+
+              <span className="font-mono text-slate-800 text-[11px] font-semibold break-all">
                 {payment?.orderId || '—'}
               </span>
             </div>
@@ -238,15 +313,18 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               <span className="text-[10px] text-slate-400 block uppercase font-medium">
                 Record Status
               </span>
+
               <span className="font-semibold text-slate-700 text-[11px]">
                 {payment?.status === 'CAPTURED'
-                  ? payment.simulated === false
+                  ? isPayPalPayment
                     ? 'Captured'
                     : 'Simulated release (no funds moved)'
                   : payment?.status === 'AUTHORIZED'
-                  ? payment.simulated === false
+                  ? isPayPalPayment
                     ? 'Authorized'
                     : 'Simulated authorization (no funds held)'
+                  : payment?.status === 'CREATED'
+                  ? 'Order created — awaiting approval'
                   : 'No payment record yet'}
               </span>
             </div>
@@ -255,28 +333,34 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               <span className="text-[10px] text-slate-400 block uppercase font-medium">
                 Provider
               </span>
+
               <span className="text-slate-700 text-[11px]">
-                {payment?.provider === 'PAYPAL' && payment.simulated === false
-                  ? 'PayPal'
+                {isPayPalPayment
+                  ? 'PayPal Sandbox'
                   : 'Development (LOCAL_DEV)'}
               </span>
             </div>
           </div>
 
           <div className="text-[11px] text-slate-500 bg-white/60 p-2 rounded border border-slate-200/60 leading-relaxed">
-            <strong className="text-slate-700">Development mode:</strong> PayPal is not integrated yet.
-            Authorization and release shown here are simulated records only. No funds are reserved,
-            captured, or transferred. A PayPal authorization is also not escrow.
+            <strong className="text-slate-700">
+              {isPayPalPayment ? 'PayPal Sandbox:' : 'Payment mode:'}
+            </strong>{' '}
+            {isPayPalPayment
+              ? 'This payment uses PayPal Sandbox. Authorization is not capture or escrow.'
+              : 'Sandbox checkout is available when this milestone is awaiting payment authorization.'}
           </div>
         </div>
       </div>
 
-      {/* Acceptance Criteria Matrix Card */}
+      {/* Acceptance Criteria */}
       <Card
         title="Agreed Acceptance Criteria"
         subtitle="Verifiable benchmarks required for milestone sign-off and payment release"
         action={
-          !isAddingCriterion && activeRole === 'CLIENT' && !termsLocked && (
+          !isAddingCriterion &&
+          activeRole === 'CLIENT' &&
+          !termsLocked && (
             <Button
               size="sm"
               variant="outline"
@@ -303,29 +387,35 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                   <div className="w-5 h-5 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 text-[11px] font-semibold mt-0.5 shrink-0">
                     {idx + 1}
                   </div>
+
                   <div className="flex-1 text-xs text-slate-700 font-medium leading-relaxed">
                     {criterion}
                   </div>
+
                   <Badge variant="neutral" size="sm">
-                    {milestone.status === 'COMPLETED' ? 'Verified' : 'Pending Verification'}
+                    {milestone.status === 'COMPLETED'
+                      ? 'Verified'
+                      : 'Pending Verification'}
                   </Badge>
                 </div>
               ))}
             </div>
           )}
 
-          {/* Add Criterion Input */}
           {isAddingCriterion && (
             <div className="pt-3 border-t border-slate-100 space-y-2">
               <input
                 type="text"
-                placeholder="e.g. Inbound webhooks validated with HMAC SHA-256 signature..."
+                placeholder="Enter an acceptance criterion..."
                 value={newCriterion}
                 onChange={(e) => setNewCriterion(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleAddCriterion()}
+                onKeyDown={(e) =>
+                  e.key === 'Enter' && handleAddCriterion()
+                }
                 className="w-full text-xs px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-slate-900"
                 autoFocus
               />
+
               <div className="flex items-center gap-2 justify-end">
                 <Button
                   size="sm"
@@ -337,6 +427,7 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                 >
                   Cancel
                 </Button>
+
                 <Button
                   size="sm"
                   variant="primary"
@@ -351,20 +442,25 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
         </div>
       </Card>
 
-      {/* Deliverable & Evidence Section */}
+      {/* Deliverable & Evidence */}
       <Card
         title="Deliverable Submissions & Accessible Evidence"
         subtitle="Inspect deliverables and concrete evidence submitted by freelancer"
         action={
-          latestSubmission && canAudit && (
+          latestSubmission &&
+          canAudit && (
             <Button
               size="sm"
               variant="outline"
               isLoading={isAuditingAI}
               onClick={handleRunAIAudit}
-              leftIcon={<Sparkles className="w-3.5 h-3.5 text-indigo-600" />}
+              leftIcon={
+                <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+              }
             >
-              {latestAIReview ? 'Re-run AI Evidence Audit' : 'Audit Evidence with AI'}
+              {latestAIReview
+                ? 'Re-run AI Evidence Audit'
+                : 'Audit Evidence with AI'}
             </Button>
           )
         }
@@ -384,8 +480,11 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                   <FileText className="w-4 h-4 text-slate-600" />
                   Submission #{latestSubmission.id.substring(0, 8)}
                 </span>
+
                 <span className="text-[11px] text-slate-500">
-                  {new Date(latestSubmission.createdAt).toLocaleDateString()}
+                  {new Date(
+                    latestSubmission.createdAt
+                  ).toLocaleDateString()}
                 </span>
               </div>
 
@@ -400,8 +499,9 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
 
               <div>
                 <span className="text-[11px] font-medium text-slate-500 block uppercase">
-                  Verified Deliverable URL
+                  Deliverable URL
                 </span>
+
                 {safeHref(latestSubmission.deliverableUrl) ? (
                   <a
                     href={safeHref(latestSubmission.deliverableUrl) as string}
@@ -422,8 +522,9 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               {latestSubmission.uploadedEvidenceText && (
                 <div>
                   <span className="text-[11px] font-medium text-slate-500 block uppercase mb-1">
-                    Accessible Evidence Artifact (Code / Benchmark Data)
+                    Accessible Evidence Artifact
                   </span>
+
                   <pre className="bg-slate-900 text-slate-100 p-3 rounded-lg overflow-x-auto text-[11px] font-mono leading-normal max-h-48">
                     {latestSubmission.uploadedEvidenceText.trim()}
                   </pre>
@@ -431,7 +532,6 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               )}
             </div>
 
-            {/* AI Review Display */}
             {latestAIReview ? (
               <AIAuditReportCard audit={latestAIReview} />
             ) : !canAudit ? (
@@ -445,16 +545,21 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                     <Sparkles className="w-4 h-4 text-indigo-600" />
                     AI Acceptance Criteria Audit Ready
                   </div>
+
                   <p className="text-[11px] text-indigo-800">
-                    Deliverable evidence submitted. Click to have Google Gemini evaluate each criterion objectively.
+                    Gemini can evaluate the submitted evidence against each criterion.
+                    Its assessment is advisory.
                   </p>
                 </div>
+
                 <Button
                   size="sm"
                   variant="primary"
                   isLoading={isAuditingAI}
                   onClick={handleRunAIAudit}
-                  leftIcon={<Sparkles className="w-3.5 h-3.5 text-emerald-400" />}
+                  leftIcon={
+                    <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                  }
                 >
                   Run AI Audit
                 </Button>
@@ -467,7 +572,6 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               No deliverable has been submitted for this milestone yet.
             </div>
 
-            {/* Freelancer Submission Form */}
             {activeRole === 'FREELANCER' && (
               <div className="bg-slate-50/60 border border-slate-200 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between">
@@ -475,6 +579,7 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                     <Send className="w-3.5 h-3.5 text-sky-600" />
                     Submit Deliverable as Marcus Chen
                   </h4>
+
                   <span className="text-[10px] text-slate-500 font-mono">
                     Freelancer Workspace
                   </span>
@@ -483,8 +588,9 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                 <div className="space-y-2 text-xs">
                   <div>
                     <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                      Deliverable URL (GitHub PR / Staging Link / Demo) *
+                      Deliverable URL *
                     </label>
+
                     <input
                       type="url"
                       required
@@ -499,23 +605,27 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                     <label className="block text-[11px] font-medium text-slate-700 mb-1">
                       Summary of Completed Work *
                     </label>
+
                     <textarea
                       rows={2}
                       required
-                      placeholder="Detailed explanation of how the agreed acceptance criteria were met..."
+                      placeholder="Explain how the acceptance criteria were met..."
                       value={deliverableSummary}
-                      onChange={(e) => setDeliverableSummary(e.target.value)}
+                      onChange={(e) =>
+                        setDeliverableSummary(e.target.value)
+                      }
                       className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                     />
                   </div>
 
                   <div>
                     <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                      Accessible Evidence Text (Paste code snippets, benchmark logs, JSON results for Gemini evaluation)
+                      Accessible Evidence Text
                     </label>
+
                     <textarea
                       rows={4}
-                      placeholder="// Paste code functions or test logs here so Gemini can verify them directly..."
+                      placeholder="Paste code snippets, benchmark logs, or JSON results..."
                       value={evidenceText}
                       onChange={(e) => setEvidenceText(e.target.value)}
                       className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono"
@@ -540,48 +650,113 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
         )}
       </Card>
 
-      {/* Role-Specific Action Workspace Bar */}
+      {/* Role-Specific Action Workspace */}
       <div className="bg-slate-900 text-white rounded-2xl p-5 shadow-lg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div className="space-y-0.5">
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-mono uppercase bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700">
-              {activeRole === 'CLIENT' ? 'Client Authority' : 'Freelancer Workspace'}
+              {activeRole === 'CLIENT'
+                ? 'Client Authority'
+                : 'Freelancer Workspace'}
             </span>
+
             <span className="text-xs text-slate-400">
               {activeRole === 'CLIENT' ? 'Elena Vance' : 'Marcus Chen'}
             </span>
           </div>
+
           <p className="text-xs text-slate-300 pt-1">
             {activeRole === 'CLIENT'
-              ? 'Only you can approve a milestone. AI audits are strictly advisory. Payments are simulated in development mode.'
-              : 'Submit deliverables with accessible evidence text for AI evaluation.'}
+              ? 'You make the final milestone and payment decisions. AI audits are advisory.'
+              : 'Submit deliverables with accessible evidence for client review.'}
           </p>
         </div>
 
-        {actionError && (
+        {(actionError || paypalError) && (
           <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg flex items-center gap-2 text-xs text-rose-800">
             <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-            <span>{actionError}</span>
+            <span>{actionError || paypalError}</span>
           </div>
         )}
 
-        {/* Action Controls */}
         <div className="flex flex-wrap items-center gap-2">
           {activeRole === 'CLIENT' && (
             <>
+              {/* PayPal Sandbox Authorization */}
               {milestone.status === 'AWAITING_PAYMENT_AUTH' && (
-                <Button
-                  size="sm"
-                  className="bg-emerald-500 hover:bg-emerald-600 text-white border-0"
-                  leftIcon={<Lock className="w-3.5 h-3.5" />}
-                  isLoading={isUpdating}
-                  onClick={handleClientAuthorize}
-                >
-                  Authorize Funding — Simulated ({formatMoney(milestone.amountMinor, milestone.currency)})
-                </Button>
+                <div className="w-full sm:w-72 space-y-2">
+                  {paypalConfig?.enabled && paypalConfig.clientId ? (
+                    <PayPalScriptProvider
+                      options={{
+                        clientId: paypalConfig.clientId,
+                        currency: paypalConfig.currency || 'USD',
+                        intent: 'authorize',
+                      }}
+                    >
+                      <PayPalButtons
+                        style={{
+                          layout: 'vertical',
+                          shape: 'rect',
+                          label: 'pay',
+                        }}
+                        disabled={isUpdating}
+                        createOrder={async () => {
+                          setPaypalError(null);
+
+                          const order = await createPayPalOrder(
+                            milestone.id
+                          );
+
+                          return order.orderId;
+                        }}
+                        onApprove={async (data) => {
+                          try {
+                            setIsUpdating(true);
+                            setPaypalError(null);
+
+                            await authorizePayPalOrder(
+                              milestone.id,
+                              data.orderID
+                            );
+
+                            onRefresh();
+                          } catch (err) {
+                            setPaypalError(
+                              getApiErrorMessage(
+                                err,
+                                'PayPal authorization failed.'
+                              )
+                            );
+                          } finally {
+                            setIsUpdating(false);
+                          }
+                        }}
+                        onError={(err) => {
+                          console.error('PayPal checkout error:', err);
+
+                          setPaypalError(
+                            'PayPal checkout failed. Please try again.'
+                          );
+                        }}
+                      />
+                    </PayPalScriptProvider>
+                  ) : (
+                    <p className="text-xs text-amber-300">
+                      {paypalConfig === null
+                        ? 'Loading PayPal Sandbox configuration...'
+                        : 'PayPal Sandbox is not configured.'}
+                    </p>
+                  )}
+
+                  <p className="text-[10px] text-slate-400">
+                    PayPal Sandbox · Authorization only · No capture yet
+                  </p>
+                </div>
               )}
 
-              {(milestone.status === 'SUBMITTED' || milestone.status === 'AI_REVIEWED') && (
+              {/* Revision and Capture */}
+              {(milestone.status === 'SUBMITTED' ||
+                milestone.status === 'AI_REVIEWED') && (
                 <>
                   <Button
                     size="sm"
@@ -592,14 +767,26 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                   >
                     Request Revision
                   </Button>
+
                   <Button
                     size="sm"
                     className="bg-emerald-500 hover:bg-emerald-600 text-white border-0"
-                    leftIcon={<CheckCircle2 className="w-3.5 h-3.5" />}
-                    isLoading={isUpdating}
-                    onClick={handleClientApprove}
+                    leftIcon={
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    }
+                    isLoading={isCapturing}
+                    onClick={handleCapturePayment}
+                    disabled={
+                      !isPayPalPayment ||
+                      payment?.status !== 'AUTHORIZED'
+                    }
                   >
-                    Approve Milestone — Simulated, No Funds Move ({formatMoney(milestone.amountMinor, milestone.currency)})
+                    Approve & Capture Payment (
+                    {formatMoney(
+                      milestone.amountMinor,
+                      milestone.currency
+                    )}
+                    )
                   </Button>
                 </>
               )}
@@ -607,7 +794,9 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
               {milestone.status === 'COMPLETED' && (
                 <div className="text-xs font-semibold text-emerald-400 flex items-center gap-1.5 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
                   <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  Milestone Approved (simulated — no real payment)
+                  {payment?.status === 'CAPTURED'
+                    ? 'Payment captured successfully'
+                    : 'Milestone completed'}
                 </div>
               )}
             </>
@@ -616,9 +805,9 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
           {activeRole === 'FREELANCER' && (
             <div className="text-xs text-slate-300">
               {milestone.status === 'AWAITING_PAYMENT_AUTH'
-                ? 'Pending client funding authorization (simulated in development) before work begins.'
+                ? 'Waiting for client PayPal authorization.'
                 : milestone.status === 'COMPLETED'
-                ? 'Milestone approved by the client. No real payment was made in development mode.'
+                ? 'Milestone completed. Check the payment record for capture status.'
                 : milestone.status === 'REVISION_REQUESTED'
                 ? 'The client requested a revision. Submit an updated deliverable.'
                 : milestone.status === 'IN_PROGRESS'

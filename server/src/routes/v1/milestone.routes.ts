@@ -1,3 +1,4 @@
+
 import { Router } from 'express';
 import { prisma } from '../../db';
 import { z } from 'zod';
@@ -27,11 +28,9 @@ import { applyMilestoneTransition } from '../../services/milestone.service';
 
 export const milestoneRouter = Router();
 
-// Every milestone endpoint requires an explicit, valid demo role (401/403 otherwise).
+// Every milestone endpoint requires an explicit, valid demo role.
 milestoneRouter.use(requireDemoRole());
 
-// NOTE: `status` is intentionally NOT part of this schema. Status changes go
-// through POST /:id/transition, which validates them against the state machine.
 const UpdateMilestoneSchema = z
   .object({
     title: z.string().trim().min(2).max(LIMITS.TITLE_MAX).optional(),
@@ -62,6 +61,7 @@ milestoneRouter.get('/:id', async (req, res, next) => {
     if (!milestone) {
       throw new HttpError(404, 'MILESTONE_NOT_FOUND', 'Milestone not found');
     }
+
     assertProjectParty(milestone.project, req.demoUser!);
 
     const { legacyTotalBudget: _legacy, ...project } = milestone.project as any;
@@ -71,8 +71,7 @@ milestoneRouter.get('/:id', async (req, res, next) => {
   }
 });
 
-// PATCH /api/v1/milestones/:id - edit milestone content (CLIENT owner only).
-// Cannot change status. Amount / acceptance criteria are frozen once funded/active.
+// PATCH /api/v1/milestones/:id
 milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -84,20 +83,24 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
         'Milestone status cannot be changed with PATCH. Use POST /milestones/:id/transition.'
       );
     }
+
     const validated = UpdateMilestoneSchema.parse(req.body);
 
     const milestone = await prisma.milestone.findUnique({
       where: { id },
       include: { project: true },
     });
+
     if (!milestone) {
       throw new HttpError(404, 'MILESTONE_NOT_FOUND', 'Milestone not found');
     }
+
     assertProjectParty(milestone.project, req.demoUser!);
 
     if (isMilestoneFrozen(milestone.status)) {
       throw new HttpError(409, 'MILESTONE_FROZEN', 'A completed milestone cannot be edited.');
     }
+
     if (
       (validated.amount !== undefined || validated.acceptanceCriteria !== undefined) &&
       areCommercialTermsLocked(milestone.status)
@@ -110,8 +113,10 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
     }
 
     const updateData: any = {};
+
     if (validated.title !== undefined) updateData.title = validated.title;
     if (validated.description !== undefined) updateData.description = validated.description;
+
     if (validated.acceptanceCriteria !== undefined) {
       updateData.acceptanceCriteria = JSON.stringify(validated.acceptanceCriteria);
     }
@@ -120,15 +125,27 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
       if (!isSupportedCurrency(milestone.currency)) {
         throw new HttpError(409, 'UNSUPPORTED_CURRENCY', 'Milestone currency is not supported.');
       }
+
       let amountMinor: number;
+
       try {
         amountMinor = parseDecimalToMinor(validated.amount, milestone.currency);
       } catch (e) {
-        throw new HttpError(400, 'INVALID_AMOUNT', e instanceof MoneyError ? e.message : 'Invalid amount');
+        throw new HttpError(
+          400,
+          'INVALID_AMOUNT',
+          e instanceof MoneyError ? e.message : 'Invalid amount'
+        );
       }
-      // The project's milestone amounts must keep summing EXACTLY to the project budget.
-      const siblings = await prisma.milestone.findMany({ where: { projectId: milestone.projectId } });
-      const newSum = sumMinor(siblings.map((s) => (s.id === milestone.id ? amountMinor : s.amountMinor)));
+
+      const siblings = await prisma.milestone.findMany({
+        where: { projectId: milestone.projectId },
+      });
+
+      const newSum = sumMinor(
+        siblings.map((s) => (s.id === milestone.id ? amountMinor : s.amountMinor))
+      );
+
       if (newSum !== milestone.project.totalBudgetMinor) {
         throw new HttpError(
           409,
@@ -136,6 +153,7 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
           `Milestone amounts would total ${minorToDecimalString(newSum, milestone.currency)} but the project budget is ${minorToDecimalString(milestone.project.totalBudgetMinor, milestone.currency)}. Amounts must always add up exactly.`
         );
       }
+
       updateData.amountMinor = amountMinor;
     }
 
@@ -144,22 +162,40 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
         updateData.deadline = null;
       } else {
         const d = parseStrictDeadline(validated.deadline);
-        const problem = d ? deadlineProblem(d) : 'Deadline must be a valid ISO date (YYYY-MM-DD) or date-time.';
-        if (!d || problem) throw new HttpError(400, 'INVALID_DEADLINE', problem!);
-        if (milestone.project.deadline && d.getTime() > new Date(milestone.project.deadline).getTime()) {
-          throw new HttpError(400, 'DEADLINE_AFTER_PROJECT', 'Milestone deadline must not be after the project deadline.');
+        const problem = d
+          ? deadlineProblem(d)
+          : 'Deadline must be a valid ISO date (YYYY-MM-DD) or date-time.';
+
+        if (!d || problem) {
+          throw new HttpError(400, 'INVALID_DEADLINE', problem!);
         }
+
+        if (
+          milestone.project.deadline &&
+          d.getTime() > new Date(milestone.project.deadline).getTime()
+        ) {
+          throw new HttpError(
+            400,
+            'DEADLINE_AFTER_PROJECT',
+            'Milestone deadline must not be after the project deadline.'
+          );
+        }
+
         updateData.deadline = d;
       }
     }
 
-    // Compare-and-set on status so an edit cannot race with a transition.
     const result = await prisma.milestone.updateMany({
       where: { id, status: milestone.status },
       data: updateData,
     });
+
     if (result.count !== 1) {
-      throw new HttpError(409, 'MILESTONE_STATE_CONFLICT', 'Milestone changed while editing. Reload and try again.');
+      throw new HttpError(
+        409,
+        'MILESTONE_STATE_CONFLICT',
+        'Milestone changed while editing. Reload and try again.'
+      );
     }
 
     const updated = await prisma.milestone.findUnique({
@@ -173,8 +209,7 @@ milestoneRouter.patch('/:id', requireDemoRole('CLIENT'), async (req, res, next) 
   }
 });
 
-// POST /api/v1/milestones/:id/transition - human-driven status transitions only.
-// Validated server-side against the state machine and project ownership.
+// POST /api/v1/milestones/:id/transition
 milestoneRouter.post('/:id/transition', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -185,12 +220,32 @@ milestoneRouter.post('/:id/transition', async (req, res, next) => {
       where: { id },
       include: { project: true },
     });
+
     if (!milestone) {
       throw new HttpError(404, 'MILESTONE_NOT_FOUND', 'Milestone not found');
     }
+
     assertProjectParty(milestone.project, user);
 
+    // When PayPal is configured, payment-related transitions must
+    // go through the dedicated PayPal endpoints, not simulated payments.
+    const paypalConfigured =
+      process.env.PAYPAL_CLIENT_ID &&
+      process.env.PAYPAL_CLIENT_SECRET;
+
+    if (
+      paypalConfigured &&
+      ['IN_PROGRESS', 'COMPLETED'].includes(to)
+    ) {
+      throw new HttpError(
+        409,
+        'PAYPAL_ACTION_REQUIRED',
+        'Use the dedicated PayPal authorization or capture endpoint for this action.'
+      );
+    }
+
     const check = checkTransition(milestone.status, to, user.role, { direct: true });
+
     if (!check.ok) {
       throw new HttpError(check.httpStatus, check.code, check.message);
     }

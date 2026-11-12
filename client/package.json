@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@paypal/react-paypal-js": "^10.6.1",
     "@proofpay/shared": "file:../shared",
     "axios": "^1.6.8",
     "clsx": "^2.1.0",

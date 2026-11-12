@@ -270,3 +270,44 @@ export async function fetchAIConfig() {
   const { data } = await apiClient.get('/ai/config');
   return data;
 }
+
+export interface PayPalConfig {
+  enabled: boolean;
+  clientId: string;
+  currency: string;
+  environment: 'sandbox';
+}
+
+export async function fetchPayPalConfig(): Promise<PayPalConfig> {
+  const { data } = await apiClient.get<PayPalConfig>('/payments/config');
+  return data;
+}
+
+export async function createPayPalOrder(milestoneId: string) {
+  const { data } = await apiClient.post<{
+    success: boolean;
+    orderId: string;
+    approvalUrl: string;
+    environment: string;
+  }>(`/payments/milestones/${milestoneId}/order`);
+
+  return data;
+}
+
+export async function authorizePayPalOrder(
+  milestoneId: string,
+  orderId: string
+) {
+  const { data } = await apiClient.post(
+    `/payments/milestones/${milestoneId}/authorize`,
+    { orderId }
+  );
+  return data;
+}
+
+export async function capturePayPalMilestone(milestoneId: string) {
+  const { data } = await apiClient.post(
+    `/payments/milestones/${milestoneId}/capture`
+  );
+  return data;
+}
