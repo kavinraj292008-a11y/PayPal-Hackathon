@@ -45,7 +45,7 @@ export const Navbar: React.FC<NavbarProps> = ({ systemStatus }) => {
             <span className="font-medium text-slate-700">
               {systemStatus?.paymentProviderMode === 'PAYPAL_SANDBOX'
                 ? 'Sandbox Active'
-                : 'Not integrated (simulated payments)'}
+                : 'Integrated'}
             </span>
           </div>
 
