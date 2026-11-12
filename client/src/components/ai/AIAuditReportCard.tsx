@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { Badge } from '../common/Badge';
 import {
@@ -25,7 +26,6 @@ export interface AIAuditData {
   id?: string;
   overallScore: number;
   overallStatus?: string;
-  /** % of criteria the evidence allowed a verdict on. NOT a probability that the verdicts are correct. */
   evidenceCoveragePercent?: number;
   scoringPolicyVersion?: string;
   recommendationReasons?: string[];
@@ -110,7 +110,6 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
 
   return (
     <div className="bg-white border border-slate-200/90 rounded-2xl p-5 shadow-subtle space-y-5">
-      {/* Header with AI Model & Advisory Notice */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-4 border-b border-slate-100">
         <div className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg bg-indigo-50 border border-indigo-200/80 flex items-center justify-center text-indigo-700">
@@ -132,9 +131,7 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
         <div>{getRecommendationBadge(audit.recommendation)}</div>
       </div>
 
-      {/* Score & Executive Summary Block */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 bg-slate-50 border border-slate-200/80 rounded-xl p-4">
-        {/* Score Pillar */}
         <div className="text-center md:text-left md:border-r border-slate-200 md:pr-4 flex flex-col justify-center">
           <span className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
             Compliance Score
@@ -166,7 +163,6 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
           )}
         </div>
 
-        {/* Executive Summary */}
         <div className="md:col-span-3 flex flex-col justify-center">
           <span className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
             Auditor Executive Summary
@@ -183,7 +179,6 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
         </div>
       </div>
 
-      {/* Criterion-by-Criterion Results Table */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
@@ -232,9 +227,7 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
         </div>
       </div>
 
-      {/* Missing Requirements & Risks */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-        {/* Missing Requirements */}
         <div className="bg-amber-50/70 border border-amber-200/80 rounded-xl p-3.5 space-y-2">
           <div className="flex items-center gap-1.5 font-semibold text-amber-900">
             <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
@@ -256,7 +249,6 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
           )}
         </div>
 
-        {/* Identified Risks */}
         <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
           <div className="flex items-center gap-1.5 font-semibold text-slate-800">
             <ShieldAlert className="w-3.5 h-3.5 text-slate-600" />
@@ -279,7 +271,6 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
         </div>
       </div>
 
-      {/* Clear Evidence Limitations */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-1 text-xs">
         <div className="font-semibold text-slate-800 flex items-center gap-1.5">
           <Clock className="w-3.5 h-3.5 text-slate-500" />
@@ -298,11 +289,11 @@ export const AIAuditReportCard: React.FC<AIAuditReportCardProps> = ({ audit }) =
         </ul>
       </div>
 
-      {/* Mandatory Non-Automated Payment Disclaimer */}
+      {/* PayPal Sandbox and AI governance disclaimer */}
       <div className="p-3 bg-indigo-50/70 border border-indigo-200/80 rounded-xl text-[11px] text-indigo-950 flex items-start gap-2 leading-relaxed">
         <Sparkles className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
         <span>
-          <strong>AI Governance Guardrail:</strong> This evaluation is strictly advisory and evidentiary. The AI cannot approve a milestone or release funds, and has no access to payment records. The human client retains final approval authority. PayPal is not integrated yet; payments are simulated.
+          <strong>AI Governance Guardrail:</strong> This evaluation is strictly advisory and evidentiary. The AI cannot approve a milestone or release funds, and has no authority over payment records. The human client retains final approval authority. <strong>PayPal Sandbox:</strong> Payment authorization and capture are available for testing. Sandbox transactions use test accounts and do not move real funds.
         </span>
       </div>
     </div>
