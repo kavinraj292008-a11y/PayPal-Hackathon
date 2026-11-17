@@ -703,11 +703,25 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                         createOrder={async () => {
                           setPaypalError(null);
 
-                          const order = await createPayPalOrder(
-                            milestone.id
-                          );
+                          try {
+                            const order = await createPayPalOrder(
+                              milestone.id
+                            );
 
-                          return order.orderId;
+                            return order.orderId;
+                          } catch (err) {
+                            // Show the backend's safe diagnostic (HTTP status, PayPal error
+                            // name, issue and debug_id) instead of a generic failure.
+                            console.error('PayPal order creation failed:', err);
+
+                            const message = getApiErrorMessage(
+                              err,
+                              'Unable to create the PayPal order.'
+                            );
+                            setPaypalError(message);
+
+                            throw new Error(message);
+                          }
                         }}
                         onApprove={async (data) => {
                           try {
@@ -734,8 +748,14 @@ export const MilestoneDetailView: React.FC<MilestoneDetailViewProps> = ({
                         onError={(err) => {
                           console.error('PayPal checkout error:', err);
 
+                          // Keep a more specific backend diagnostic if createOrder already
+                          // set one; otherwise show the SDK's message, then a generic fallback.
                           setPaypalError(
-                            'PayPal checkout failed. Please try again.'
+                            (current) =>
+                              current ??
+                              (err instanceof Error && err.message
+                                ? `PayPal checkout failed: ${err.message}`
+                                : 'PayPal checkout failed. Please try again.')
                           );
                         }}
                       />
