@@ -1,0 +1,871 @@
+diff -ruN -x node_modules -x dist -x .testbuild -x '*.tsbuildinfo' -x package-lock.json a/client/src/components/milestones/MilestoneDetailView.tsx b/client/src/components/milestones/MilestoneDetailView.tsx
+--- a/client/src/components/milestones/MilestoneDetailView.tsx	2026-11-12 18:00:19.000000000 +0000
++++ b/client/src/components/milestones/MilestoneDetailView.tsx	2026-11-17 12:42:13.190824398 +0000
+@@ -703,11 +703,25 @@
+                         createOrder={async () => {
+                           setPaypalError(null);
+ 
+-                          const order = await createPayPalOrder(
+-                            milestone.id
+-                          );
++                          try {
++                            const order = await createPayPalOrder(
++                              milestone.id
++                            );
++
++                            return order.orderId;
++                          } catch (err) {
++                            // Show the backend's safe diagnostic (HTTP status, PayPal error
++                            // name, issue and debug_id) instead of a generic failure.
++                            console.error('PayPal order creation failed:', err);
++
++                            const message = getApiErrorMessage(
++                              err,
++                              'Unable to create the PayPal order.'
++                            );
++                            setPaypalError(message);
+ 
+-                          return order.orderId;
++                            throw new Error(message);
++                          }
+                         }}
+                         onApprove={async (data) => {
+                           try {
+@@ -734,8 +748,14 @@
+                         onError={(err) => {
+                           console.error('PayPal checkout error:', err);
+ 
++                          // Keep a more specific backend diagnostic if createOrder already
++                          // set one; otherwise show the SDK's message, then a generic fallback.
+                           setPaypalError(
+-                            'PayPal checkout failed. Please try again.'
++                            (current) =>
++                              current ??
++                              (err instanceof Error && err.message
++                                ? `PayPal checkout failed: ${err.message}`
++                                : 'PayPal checkout failed. Please try again.')
+                           );
+                         }}
+                       />
+diff -ruN -x node_modules -x dist -x .testbuild -x '*.tsbuildinfo' -x package-lock.json a/server/package.json b/server/package.json
+--- a/server/package.json	2026-11-12 18:00:19.000000000 +0000
++++ b/server/package.json	2026-11-17 12:42:18.406321593 +0000
+@@ -11,8 +11,8 @@
+     "dev": "tsx watch src/index.ts",
+     "build": "tsc",
+     "start": "node dist/index.js",
+-    "test": "tsx --test tests/health.test.ts tests/phase0.test.ts tests/phase1.api.test.ts tests/money.test.ts tests/aiScoring.test.ts tests/gemini.service.test.ts tests/migration.test.ts tests/seed.integrity.test.ts",
+-    "test:hermetic": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase0.test.js .testbuild/tests/phase1.api.test.js .testbuild/tests/money.test.js .testbuild/tests/aiScoring.test.js .testbuild/tests/gemini.service.test.js .testbuild/tests/migration.test.js .testbuild/tests/seed.integrity.test.js",
++    "test": "tsx --test tests/health.test.ts tests/phase0.test.ts tests/phase1.api.test.ts tests/money.test.ts tests/aiScoring.test.ts tests/gemini.service.test.ts tests/migration.test.ts tests/seed.integrity.test.ts tests/paypal.service.test.ts",
++    "test:hermetic": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase0.test.js .testbuild/tests/phase1.api.test.js .testbuild/tests/money.test.js .testbuild/tests/aiScoring.test.js .testbuild/tests/gemini.service.test.js .testbuild/tests/migration.test.js .testbuild/tests/seed.integrity.test.js .testbuild/tests/paypal.service.test.js",
+     "test:phase0": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase0.test.js",
+     "test:phase1": "tsc -p tsconfig.test.json && node --test .testbuild/tests/phase1.api.test.js .testbuild/tests/money.test.js .testbuild/tests/aiScoring.test.js .testbuild/tests/gemini.service.test.js .testbuild/tests/migration.test.js .testbuild/tests/seed.integrity.test.js",
+     "prisma:migrate": "prisma migrate deploy",
+diff -ruN -x node_modules -x dist -x .testbuild -x '*.tsbuildinfo' -x package-lock.json a/server/src/services/paypal.service.ts b/server/src/services/paypal.service.ts
+--- a/server/src/services/paypal.service.ts	2026-11-12 18:00:19.000000000 +0000
++++ b/server/src/services/paypal.service.ts	2026-11-17 12:41:13.223635823 +0000
+@@ -1,5 +1,30 @@
+ 
+ import { randomUUID } from 'node:crypto';
++import { HttpError } from '../errors';
++import { logEvent } from '../utils/safeLog';
++
++/**
++ * PayPal REST client (Orders v2 + Payments v2).
++ *
++ * Diagnostics contract
++ * --------------------
++ * Every upstream call (OAuth, create order, get order, authorize, capture) goes through
++ * `executePayPalHttp`, which:
++ *   - reads the body as text and parses it defensively (JSON, HTML, plain text or empty),
++ *   - keeps the upstream HTTP status, PayPal error name, `details[].issue` codes and `debug_id`,
++ *   - logs ONE structured line per call (operation, status, outcome, error name, issues, debug id),
++ *   - converts every failure into an `HttpError` whose message is safe to show to the client.
++ *
++ * It never logs or returns: the client secret, Basic/Bearer credentials, access tokens,
++ * request/response bodies, or any buyer information.
++ */
++
++export type PayPalOperation =
++  | 'oauth'
++  | 'create_order'
++  | 'get_order'
++  | 'authorize_order'
++  | 'capture_authorization';
+ 
+ const getBaseUrl = () =>
+   process.env.PAYPAL_ENVIRONMENT === 'live'
+@@ -9,12 +34,230 @@
+ let cachedToken: string | null = null;
+ let tokenExpiresAt = 0;
+ 
++/** Clears the in-memory OAuth token cache (used by tests). */
++export function resetPayPalTokenCache(): void {
++  cachedToken = null;
++  tokenExpiresAt = 0;
++}
++
++// ---------------------------------------------------------------------------
++// Safe parsing and diagnostics
++// ---------------------------------------------------------------------------
++
++const MAX_TEXT_LENGTH = 200;
++const MAX_ISSUE_LENGTH = 100;
++const MAX_ISSUES = 5;
++
++/** Returns a short, single-line, credential-free string, or undefined if there is nothing usable. */
++function safeText(value: unknown, max = MAX_TEXT_LENGTH): string | undefined {
++  if (typeof value !== 'string') return undefined;
++
++  let cleaned = value;
++
++  // Defence in depth: never let a credential-shaped value through, even if upstream echoed one.
++  const secret = process.env.PAYPAL_CLIENT_SECRET;
++  if (secret && secret.length >= 8) {
++    cleaned = cleaned.split(secret).join('[redacted]');
++  }
++  cleaned = cleaned
++    .replace(/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [redacted]')
++    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
++    .trim();
++
++  return cleaned ? cleaned.slice(0, max) : undefined;
++}
++
++type BodyKind = 'json' | 'empty' | 'html' | 'text';
++
++interface ParsedBody {
++  kind: BodyKind;
++  json?: Record<string, unknown>;
++}
++
++function parseBody(raw: string, contentType: string | null): ParsedBody {
++  const trimmed = raw.trim();
++  if (!trimmed) return { kind: 'empty' };
++
++  try {
++    const parsed: unknown = JSON.parse(trimmed);
++    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
++      return { kind: 'json', json: parsed as Record<string, unknown> };
++    }
++    return { kind: 'text' };
++  } catch {
++    const looksLikeHtml =
++      trimmed.startsWith('<') || (contentType ?? '').toLowerCase().includes('html');
++    return { kind: looksLikeHtml ? 'html' : 'text' };
++  }
++}
++
++interface Diagnostics {
++  operation: PayPalOperation;
++  status: number;
++  bodyKind: BodyKind;
++  errorName?: string;
++  message?: string;
++  issues: string[];
++  debugId?: string;
++}
++
++function collectDiagnostics(
++  operation: PayPalOperation,
++  response: Response,
++  body: ParsedBody,
++): Diagnostics {
++  const json = body.json;
++  const details: unknown[] = Array.isArray(json?.details) ? (json.details as unknown[]) : [];
++
++  const issues = details
++    .map((d) => safeText((d as { issue?: unknown } | null)?.issue, MAX_ISSUE_LENGTH))
++    .filter((issue): issue is string => Boolean(issue))
++    .slice(0, MAX_ISSUES);
++
++  return {
++    operation,
++    status: response.status,
++    bodyKind: body.kind,
++    // Orders/Payments APIs use `name`; the OAuth endpoint uses `error`.
++    errorName: safeText(json?.name, MAX_ISSUE_LENGTH) ?? safeText(json?.error, MAX_ISSUE_LENGTH),
++    message: safeText(json?.message) ?? safeText(json?.error_description),
++    issues,
++    debugId:
++      safeText(json?.debug_id, MAX_ISSUE_LENGTH) ??
++      safeText(response.headers.get('paypal-debug-id'), MAX_ISSUE_LENGTH),
++  };
++}
++
++/** Maps an upstream failure to a safe HTTP status and a stable error code for OUR API. */
++function classifyFailure(d: Diagnostics, upstreamOk: boolean): { httpStatus: number; code: string } {
++  if (upstreamOk) return { httpStatus: 502, code: 'PAYPAL_INVALID_RESPONSE' };
++  if (d.status === 401 || d.status === 403 || (d.operation === 'oauth' && d.status === 400)) {
++    return { httpStatus: 502, code: 'PAYPAL_AUTH_FAILED' };
++  }
++  if (d.status === 429) return { httpStatus: 503, code: 'PAYPAL_RATE_LIMITED' };
++  if (d.status >= 500) return { httpStatus: 502, code: 'PAYPAL_UNAVAILABLE' };
++  if (d.bodyKind !== 'json') return { httpStatus: 502, code: 'PAYPAL_INVALID_RESPONSE' };
++  return { httpStatus: 502, code: 'PAYPAL_API_ERROR' };
++}
++
++function buildMessage(d: Diagnostics, upstreamOk: boolean): string {
++  const parts = [`upstream HTTP ${d.status}`];
++  if (d.errorName) parts.push(d.errorName);
++  if (d.issues.length > 0) parts.push(`issue: ${d.issues.join(', ')}`);
++  if (d.bodyKind === 'empty') parts.push('empty response body');
++  else if (d.bodyKind !== 'json') parts.push(`non-JSON ${d.bodyKind} response body`);
++  if (d.message) parts.push(d.message);
++  if (d.debugId) parts.push(`debug_id: ${d.debugId}`);
++
++  const verb = upstreamOk ? 'returned an unusable response' : 'failed';
++  return `PayPal ${d.operation} ${verb} (${parts.join('; ')}).`;
++}
++
++function logCall(fields: {
++  operation: PayPalOperation;
++  outcome: 'ok' | 'error';
++  durationMs: number;
++  upstreamStatus?: number;
++  bodyKind?: BodyKind;
++  errorName?: string;
++  issues?: string[];
++  debugId?: string;
++  networkError?: string;
++  reason?: string;
++}): void {
++  logEvent('paypal_api_call', {
++    operation: fields.operation,
++    outcome: fields.outcome,
++    upstreamStatus: fields.upstreamStatus,
++    durationMs: fields.durationMs,
++    bodyKind: fields.bodyKind,
++    paypalError: fields.errorName,
++    issue: fields.issues && fields.issues.length > 0 ? fields.issues.join(',') : undefined,
++    debugId: fields.debugId,
++    networkError: fields.networkError,
++    reason: fields.reason,
++  });
++}
++
++function describeNetworkError(err: unknown): string {
++  const e = err as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | null;
++  const name = typeof e?.name === 'string' ? e.name : 'Error';
++  const code =
++    typeof e?.code === 'string'
++      ? e.code
++      : typeof e?.cause?.code === 'string'
++        ? e.cause.code
++        : undefined;
++  return safeText(code ? `${name} ${code}` : name, 100) ?? 'Error';
++}
++
++/**
++ * Performs one upstream call. Resolves with the parsed JSON object on a 2xx JSON response;
++ * otherwise logs and throws a structured, client-safe HttpError.
++ */
++async function executePayPalHttp<T extends object>(
++  operation: PayPalOperation,
++  url: string,
++  init: RequestInit,
++): Promise<T> {
++  const startedAt = Date.now();
++
++  let response: Response;
++  let rawBody: string;
++  try {
++    response = await fetch(url, init);
++    rawBody = await response.text();
++  } catch (err) {
++    const networkError = describeNetworkError(err);
++    logCall({ operation, outcome: 'error', durationMs: Date.now() - startedAt, networkError });
++    throw new HttpError(
++      502,
++      'PAYPAL_NETWORK_ERROR',
++      `PayPal ${operation} failed (could not reach PayPal: ${networkError}).`,
++    );
++  }
++
++  const body = parseBody(rawBody, response.headers.get('content-type'));
++  const diagnostics = collectDiagnostics(operation, response, body);
++  const durationMs = Date.now() - startedAt;
++
++  if (response.ok && body.kind === 'json') {
++    logCall({
++      operation,
++      outcome: 'ok',
++      durationMs,
++      upstreamStatus: response.status,
++      bodyKind: body.kind,
++      debugId: diagnostics.debugId,
++    });
++    return body.json as T;
++  }
++
++  logCall({
++    operation,
++    outcome: 'error',
++    durationMs,
++    upstreamStatus: response.status,
++    bodyKind: body.kind,
++    errorName: diagnostics.errorName,
++    issues: diagnostics.issues,
++    debugId: diagnostics.debugId,
++  });
++
++  const { httpStatus, code } = classifyFailure(diagnostics, response.ok);
++  throw new HttpError(httpStatus, code, buildMessage(diagnostics, response.ok));
++}
++
++// ---------------------------------------------------------------------------
++// OAuth
++// ---------------------------------------------------------------------------
++
+ async function getAccessToken(): Promise<string> {
+   const clientId = process.env.PAYPAL_CLIENT_ID;
+   const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+ 
+   if (!clientId || !clientSecret) {
+-    throw new Error('PayPal credentials are not configured.');
++    throw new HttpError(503, 'PAYPAL_NOT_CONFIGURED', 'PayPal credentials are not configured.');
+   }
+ 
+   if (cachedToken && Date.now() < tokenExpiresAt) {
+@@ -23,7 +266,10 @@
+ 
+   const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+ 
+-  const response = await fetch(`${getBaseUrl()}/v1/oauth2/token`, {
++  const data = await executePayPalHttp<{
++    access_token?: string;
++    expires_in?: number;
++  }>('oauth', `${getBaseUrl()}/v1/oauth2/token`, {
+     method: 'POST',
+     headers: {
+       Authorization: `Basic ${credentials}`,
+@@ -32,14 +278,18 @@
+     body: 'grant_type=client_credentials',
+   });
+ 
+-  const data = await response.json() as {
+-    access_token?: string;
+-    expires_in?: number;
+-    error_description?: string;
+-  };
+-
+-  if (!response.ok || !data.access_token) {
+-    throw new Error(data.error_description || 'PayPal authentication failed.');
++  if (typeof data.access_token !== 'string' || !data.access_token) {
++    logCall({
++      operation: 'oauth',
++      outcome: 'error',
++      durationMs: 0,
++      reason: 'missing_access_token',
++    });
++    throw new HttpError(
++      502,
++      'PAYPAL_INVALID_RESPONSE',
++      'PayPal oauth returned an unusable response (no access token in response).',
++    );
+   }
+ 
+   cachedToken = data.access_token;
+@@ -48,7 +298,12 @@
+   return cachedToken;
+ }
+ 
+-async function paypalRequest<T>(
++// ---------------------------------------------------------------------------
++// API requests
++// ---------------------------------------------------------------------------
++
++async function paypalRequest<T extends object>(
++  operation: PayPalOperation,
+   path: string,
+   method: 'GET' | 'POST',
+   body?: unknown,
+@@ -56,7 +311,7 @@
+ ): Promise<T> {
+   const token = await getAccessToken();
+ 
+-  const response = await fetch(`${getBaseUrl()}${path}`, {
++  return executePayPalHttp<T>(operation, `${getBaseUrl()}${path}`, {
+     method,
+     headers: {
+       Authorization: `Bearer ${token}`,
+@@ -65,16 +320,6 @@
+     },
+     ...(body ? { body: JSON.stringify(body) } : {}),
+   });
+-
+-  const data = await response.json();
+-
+-  if (!response.ok) {
+-    throw new Error(
+-      data?.message || data?.name || `PayPal request failed (${response.status}).`,
+-    );
+-  }
+-
+-  return data as T;
+ }
+ 
+ export async function createPayPalOrder(input: {
+@@ -92,6 +337,7 @@
+     status: string;
+     links?: Array<{ rel: string; href: string }>;
+   }>(
++    'create_order',
+     '/v2/checkout/orders',
+     'POST',
+     {
+@@ -127,6 +373,7 @@
+       };
+     }>;
+   }>(
++    'authorize_order',
+     `/v2/checkout/orders/${encodeURIComponent(orderId)}/authorize`,
+     'POST',
+     {},
+@@ -140,6 +387,7 @@
+     status: string;
+     amount?: { value: string; currency_code: string };
+   }>(
++    'capture_authorization',
+     `/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/capture`,
+     'POST',
+     {},
+@@ -162,6 +410,7 @@
+       };
+     }>;
+   }>(
++    'get_order',
+     `/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+     'GET',
+   );
+diff -ruN -x node_modules -x dist -x .testbuild -x '*.tsbuildinfo' -x package-lock.json a/server/tests/paypal.service.test.ts b/server/tests/paypal.service.test.ts
+--- a/server/tests/paypal.service.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/server/tests/paypal.service.test.ts	2026-11-17 12:42:06.887814657 +0000
+@@ -0,0 +1,427 @@
++process.env.NODE_ENV = 'test';
++import { describe, it, beforeEach, afterEach } from 'node:test';
++import assert from 'node:assert/strict';
++import express from 'express';
++import request from 'supertest';
++import { HttpError } from '../src/errors';
++import { errorHandler } from '../src/middleware/errorHandler';
++import {
++  createPayPalOrder,
++  authorizePayPalOrder,
++  capturePayPalAuthorization,
++  getPayPalOrder,
++  resetPayPalTokenCache,
++} from '../src/services/paypal.service';
++
++// Sentinel values: if any of these ever appear in a log line or error message, a secret leaked.
++const CLIENT_ID = 'unit-test-client-id';
++const CLIENT_SECRET = 'UNIT-TEST-SECRET-VALUE-123';
++const ACCESS_TOKEN = 'UNIT-TEST-ACCESS-TOKEN-ABC';
++const BASIC_CREDENTIALS = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
++
++type Call = { url: string; init: RequestInit };
++type Step = Response | Error;
++
++const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
++  new Response(JSON.stringify(body), {
++    status,
++    headers: { 'content-type': 'application/json', ...headers },
++  });
++
++const tokenResponse = () => json(200, { access_token: ACCESS_TOKEN, expires_in: 3600 });
++
++const ORDER_INPUT = {
++  milestoneId: 'milestone-1',
++  description: 'Design milestone',
++  amountMinor: 150000,
++  currency: 'USD',
++};
++
++describe('paypal.service diagnostics', () => {
++  const realFetch = globalThis.fetch;
++  const realLog = console.log;
++  const realError = console.error;
++  const realNodeEnv = process.env.NODE_ENV;
++  let calls: Call[];
++  let steps: Step[];
++  let logLines: string[];
++
++  beforeEach(() => {
++    resetPayPalTokenCache();
++    process.env.PAYPAL_CLIENT_ID = CLIENT_ID;
++    process.env.PAYPAL_CLIENT_SECRET = CLIENT_SECRET;
++    process.env.PAYPAL_ENVIRONMENT = 'sandbox';
++
++    calls = [];
++    steps = [];
++    logLines = [];
++
++    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
++      calls.push({ url: String(url), init: init ?? {} });
++      const next = steps.shift();
++      if (!next) throw new Error('Unexpected extra fetch call in test');
++      if (next instanceof Error) throw next;
++      return next;
++    }) as typeof fetch;
++
++    // logEvent is silent when NODE_ENV === 'test'; enable it so the log output can be inspected.
++    process.env.NODE_ENV = 'development';
++    console.log = (...args: unknown[]) => void logLines.push(args.map(String).join(' '));
++    console.error = (...args: unknown[]) => void logLines.push(args.map(String).join(' '));
++  });
++
++  afterEach(() => {
++    globalThis.fetch = realFetch;
++    console.log = realLog;
++    console.error = realError;
++    process.env.NODE_ENV = realNodeEnv;
++  });
++
++  const events = () =>
++    logLines
++      .filter((l) => l.startsWith('{'))
++      .map((l) => JSON.parse(l) as Record<string, unknown>)
++      .filter((e) => e.event === 'paypal_api_call');
++
++  const assertNoSecretsIn = (text: string) => {
++    for (const forbidden of [
++      CLIENT_SECRET,
++      ACCESS_TOKEN,
++      BASIC_CREDENTIALS,
++      'Bearer ',
++      'Basic ',
++      'Authorization',
++      'authorization',
++    ]) {
++      assert.ok(!text.includes(forbidden), `output leaked "${forbidden}"`);
++    }
++  };
++
++  const rejection = async (fn: () => Promise<unknown>): Promise<HttpError> => {
++    try {
++      await fn();
++    } catch (err) {
++      assert.ok(err instanceof HttpError, `expected HttpError, got ${String(err)}`);
++      return err;
++    }
++    assert.fail('expected the call to reject');
++  };
++
++  // ---- successful responses ------------------------------------------------
++
++  it('returns parsed JSON for a successful create_order and logs an ok event', async () => {
++    steps = [
++      tokenResponse(),
++      json(201, { id: 'ORDER-1', status: 'CREATED', links: [{ rel: 'approve', href: 'https://x' }] }, {
++        'paypal-debug-id': 'dbg-ok-1',
++      }),
++    ];
++
++    const order = await createPayPalOrder(ORDER_INPUT);
++    assert.equal(order.id, 'ORDER-1');
++    assert.equal(order.status, 'CREATED');
++
++    assert.equal(calls.length, 2);
++    assert.equal(calls[0].url, 'https://api-m.sandbox.paypal.com/v1/oauth2/token');
++    assert.equal(calls[1].url, 'https://api-m.sandbox.paypal.com/v2/checkout/orders');
++    const sent = JSON.parse(String(calls[1].init.body));
++    assert.equal(sent.intent, 'AUTHORIZE');
++    assert.equal(sent.purchase_units[0].amount.value, '1500.00');
++
++    const ev = events();
++    assert.deepEqual(
++      ev.map((e) => [e.operation, e.outcome, e.upstreamStatus]),
++      [
++        ['oauth', 'ok', 200],
++        ['create_order', 'ok', 201],
++      ],
++    );
++    assert.equal(ev[1].debugId, 'dbg-ok-1');
++    assertNoSecretsIn(logLines.join('\n'));
++  });
++
++  it('reuses the cached OAuth token across calls (behaviour unchanged)', async () => {
++    steps = [
++      tokenResponse(),
++      json(200, { id: 'ORDER-2', status: 'APPROVED', intent: 'AUTHORIZE' }),
++      json(200, { id: 'ORDER-2', status: 'APPROVED', intent: 'AUTHORIZE' }),
++    ];
++    await getPayPalOrder('ORDER-2');
++    await getPayPalOrder('ORDER-2');
++    assert.equal(calls.filter((c) => c.url.includes('/oauth2/token')).length, 1);
++    assert.deepEqual(events().map((e) => e.operation), ['oauth', 'get_order', 'get_order']);
++  });
++
++  it('logs authorize_order and capture_authorization operations with encoded ids', async () => {
++    steps = [
++      tokenResponse(),
++      json(201, { id: 'ORDER-3', status: 'COMPLETED' }),
++      json(201, { id: 'CAPTURE-1', status: 'COMPLETED' }),
++    ];
++    const auth = await authorizePayPalOrder('ORDER/3');
++    const cap = await capturePayPalAuthorization('AUTH-1');
++    assert.equal(auth.id, 'ORDER-3');
++    assert.equal(cap.id, 'CAPTURE-1');
++    assert.ok(calls[1].url.endsWith('/v2/checkout/orders/ORDER%2F3/authorize'));
++    assert.ok(calls[2].url.endsWith('/v2/payments/authorizations/AUTH-1/capture'));
++    assert.deepEqual(
++      events().map((e) => e.operation),
++      ['oauth', 'authorize_order', 'capture_authorization'],
++    );
++  });
++
++  // ---- JSON error responses ------------------------------------------------
++
++  it('preserves status, error name, issues and debug_id from a JSON error', async () => {
++    steps = [
++      tokenResponse(),
++      json(422, {
++        name: 'UNPROCESSABLE_ENTITY',
++        message: 'The requested action could not be performed, semantically incorrect, or failed business validation.',
++        debug_id: 'dbg-422-xyz',
++        details: [
++          { issue: 'CURRENCY_NOT_SUPPORTED', description: 'Currency is not supported for this merchant.' },
++          { issue: 'PAYEE_ACCOUNT_RESTRICTED' },
++        ],
++      }),
++    ];
++
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_API_ERROR');
++    for (const expected of [
++      'create_order',
++      'upstream HTTP 422',
++      'UNPROCESSABLE_ENTITY',
++      'CURRENCY_NOT_SUPPORTED',
++      'PAYEE_ACCOUNT_RESTRICTED',
++      'debug_id: dbg-422-xyz',
++    ]) {
++      assert.ok(err.message.includes(expected), `message missing "${expected}": ${err.message}`);
++    }
++
++    const ev = events().find((e) => e.operation === 'create_order')!;
++    assert.equal(ev.outcome, 'error');
++    assert.equal(ev.upstreamStatus, 422);
++    assert.equal(ev.paypalError, 'UNPROCESSABLE_ENTITY');
++    assert.equal(ev.issue, 'CURRENCY_NOT_SUPPORTED,PAYEE_ACCOUNT_RESTRICTED');
++    assert.equal(ev.debugId, 'dbg-422-xyz');
++    assertNoSecretsIn(logLines.join('\n') + err.message);
++  });
++
++  it('falls back to the paypal-debug-id header when the body has no debug_id', async () => {
++    steps = [
++      tokenResponse(),
++      json(400, { name: 'INVALID_REQUEST', details: [{ issue: 'MISSING_REQUIRED_PARAMETER' }] }, {
++        'paypal-debug-id': 'hdr-debug-1',
++      }),
++    ];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.ok(err.message.includes('debug_id: hdr-debug-1'));
++    assert.equal(err.code, 'PAYPAL_API_ERROR');
++  });
++
++  it('maps 429 to 503 PAYPAL_RATE_LIMITED, 5xx JSON to 502 PAYPAL_UNAVAILABLE, 401 to PAYPAL_AUTH_FAILED', async () => {
++    steps = [tokenResponse(), json(429, { name: 'RATE_LIMIT_REACHED', debug_id: 'd429' })];
++    let err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.status, 503);
++    assert.equal(err.code, 'PAYPAL_RATE_LIMITED');
++
++    steps = [json(500, { name: 'INTERNAL_SERVER_ERROR', debug_id: 'd500' })];
++    err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_UNAVAILABLE');
++
++    steps = [json(401, { name: 'AUTHENTICATION_FAILURE', debug_id: 'd401' })];
++    err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_AUTH_FAILED');
++  });
++
++  it('redacts credential-shaped text that upstream might echo', async () => {
++    steps = [
++      tokenResponse(),
++      json(400, {
++        name: 'INVALID_REQUEST',
++        message: `bad header Bearer ${ACCESS_TOKEN} for ${CLIENT_SECRET}`,
++        debug_id: 'dbg-redact',
++      }),
++    ];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.ok(err.message.includes('Bearer [redacted]'));
++    const output = err.message + logLines.join('\n');
++    // The redaction placeholder legitimately contains the word "Bearer"; the real values must be gone.
++    assert.ok(!output.includes(ACCESS_TOKEN), 'access token leaked');
++    assert.ok(!output.includes(CLIENT_SECRET), 'client secret leaked');
++    assert.ok(!output.includes(BASIC_CREDENTIALS), 'basic credentials leaked');
++  });
++
++  // ---- HTML responses ------------------------------------------------------
++
++  it('handles an HTML error page (e.g. proxy/cold-start 502) without leaking the body', async () => {
++    const html = '<html><body><h1>Bad Gateway</h1><p>internal-host-detail</p></body></html>';
++    steps = [tokenResponse(), new Response(html, { status: 502, headers: { 'content-type': 'text/html' } })];
++
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_UNAVAILABLE');
++    assert.ok(err.message.includes('upstream HTTP 502'));
++    assert.ok(err.message.includes('non-JSON html response body'));
++    assert.ok(!err.message.includes('Bad Gateway'));
++    assert.ok(!err.message.includes('internal-host-detail'));
++
++    const ev = events().find((e) => e.operation === 'create_order')!;
++    assert.equal(ev.bodyKind, 'html');
++    assert.equal(ev.upstreamStatus, 502);
++    assert.ok(!logLines.join('\n').includes('internal-host-detail'));
++  });
++
++  it('treats a 200 HTML response as an invalid response, not success', async () => {
++    steps = [tokenResponse(), new Response('<!doctype html><title>Login</title>', { status: 200 })];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('returned an unusable response'));
++    assert.ok(err.message.includes('non-JSON html response body'));
++  });
++
++  it('handles plain-text 4xx bodies as PAYPAL_INVALID_RESPONSE', async () => {
++    steps = [tokenResponse(), new Response('Forbidden by upstream', { status: 404, headers: { 'content-type': 'text/plain' } })];
++    const err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('non-JSON text response body'));
++    assert.ok(!err.message.includes('Forbidden by upstream'));
++  });
++
++  // ---- empty responses -----------------------------------------------------
++
++  it('handles an empty 200 response as an invalid response', async () => {
++    steps = [tokenResponse(), new Response('', { status: 200 })];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('empty response body'));
++    assert.equal(events().find((e) => e.operation === 'create_order')!.bodyKind, 'empty');
++  });
++
++  it('handles an empty 204 and an empty 500 response', async () => {
++    steps = [tokenResponse(), new Response(null, { status: 204 })];
++    let err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('upstream HTTP 204'));
++
++    steps = [new Response('', { status: 500 })];
++    err = await rejection(() => getPayPalOrder('O'));
++    assert.equal(err.code, 'PAYPAL_UNAVAILABLE');
++    assert.ok(err.message.includes('empty response body'));
++  });
++
++  // ---- OAuth failures ------------------------------------------------------
++
++  it('reports OAuth invalid_client as PAYPAL_AUTH_FAILED and never calls the API', async () => {
++    steps = [
++      json(401, { error: 'invalid_client', error_description: 'Client Authentication failed' }, {
++        'paypal-debug-id': 'oauth-dbg-1',
++      }),
++    ];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_AUTH_FAILED');
++    for (const expected of ['oauth', 'upstream HTTP 401', 'invalid_client', 'Client Authentication failed', 'debug_id: oauth-dbg-1']) {
++      assert.ok(err.message.includes(expected), `message missing "${expected}": ${err.message}`);
++    }
++    assert.equal(calls.length, 1, 'order endpoint must not be called after OAuth failure');
++
++    const ev = events()[0];
++    assert.equal(ev.operation, 'oauth');
++    assert.equal(ev.outcome, 'error');
++    assert.equal(ev.upstreamStatus, 401);
++    assert.equal(ev.paypalError, 'invalid_client');
++    assert.equal(ev.debugId, 'oauth-dbg-1');
++    assertNoSecretsIn(logLines.join('\n') + err.message);
++  });
++
++  it('does not cache a failed OAuth attempt', async () => {
++    steps = [json(401, { error: 'invalid_client' })];
++    await rejection(() => getPayPalOrder('O'));
++    steps = [tokenResponse(), json(200, { id: 'O', status: 'APPROVED', intent: 'AUTHORIZE' })];
++    const order = await getPayPalOrder('O');
++    assert.equal(order.id, 'O');
++  });
++
++  it('handles an HTML OAuth response and an empty OAuth response', async () => {
++    steps = [new Response('<html>gateway</html>', { status: 503, headers: { 'content-type': 'text/html' } })];
++    let err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.code, 'PAYPAL_UNAVAILABLE');
++    assert.ok(err.message.startsWith('PayPal oauth failed'));
++    assert.ok(err.message.includes('non-JSON html response body'));
++
++    steps = [new Response('', { status: 200 })];
++    err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('empty response body'));
++  });
++
++  it('rejects an OAuth 200 response that has no access_token', async () => {
++    steps = [json(200, { token_type: 'Bearer' })];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_INVALID_RESPONSE');
++    assert.ok(err.message.includes('no access token'));
++    assert.equal(calls.length, 1);
++    assert.ok(events().some((e) => e.operation === 'oauth' && e.reason === 'missing_access_token'));
++  });
++
++  it('reports a network failure as PAYPAL_NETWORK_ERROR without echoing the raw message', async () => {
++    const cause = Object.assign(new Error('getaddrinfo ENOTFOUND api-m.sandbox.paypal.com'), { code: 'ENOTFOUND' });
++    const netErr = Object.assign(new TypeError('fetch failed'), { cause });
++    steps = [netErr];
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 502);
++    assert.equal(err.code, 'PAYPAL_NETWORK_ERROR');
++    assert.ok(err.message.includes('TypeError ENOTFOUND'));
++    assert.ok(!err.message.includes('getaddrinfo'));
++    const ev = events()[0];
++    assert.equal(ev.operation, 'oauth');
++    assert.equal(ev.networkError, 'TypeError ENOTFOUND');
++  });
++
++  it('reports missing credentials as 503 PAYPAL_NOT_CONFIGURED without any network call', async () => {
++    process.env.PAYPAL_CLIENT_SECRET = '';
++    const err = await rejection(() => createPayPalOrder(ORDER_INPUT));
++    assert.equal(err.status, 503);
++    assert.equal(err.code, 'PAYPAL_NOT_CONFIGURED');
++    assert.equal(calls.length, 0);
++  });
++
++  it('still rejects invalid amounts before any network call', async () => {
++    await assert.rejects(() => createPayPalOrder({ ...ORDER_INPUT, amountMinor: 0 }), /Invalid milestone amount/);
++    assert.equal(calls.length, 0);
++  });
++
++  // ---- API envelope --------------------------------------------------------
++
++  it('surfaces the diagnostic message through the Express error envelope', async () => {
++    steps = [
++      tokenResponse(),
++      json(422, {
++        name: 'UNPROCESSABLE_ENTITY',
++        debug_id: 'dbg-envelope',
++        details: [{ issue: 'CURRENCY_NOT_SUPPORTED' }],
++      }),
++    ];
++    const app = express();
++    app.post('/order', (_req, res, next) => {
++      createPayPalOrder(ORDER_INPUT).then((o) => res.json(o), next);
++    });
++    app.use(errorHandler);
++
++    const res = await request(app).post('/order');
++    assert.equal(res.status, 502);
++    assert.equal(res.body.code, 'PAYPAL_API_ERROR');
++    assert.ok(res.body.error.includes('UNPROCESSABLE_ENTITY'));
++    assert.ok(res.body.error.includes('CURRENCY_NOT_SUPPORTED'));
++    assert.ok(res.body.error.includes('debug_id: dbg-envelope'));
++    assertNoSecretsIn(JSON.stringify(res.body));
++  });
++});
